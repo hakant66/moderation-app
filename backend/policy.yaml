@@ -1,0 +1,21 @@
+# Map moderation categories -> thresholds -> actions.
+# Actions: allow | warn | support | block | ban
+rules:
+  hate/threatening: { threshold: 0.50, action: block }
+  harassment/threats: { threshold: 0.50, action: block }
+  harassment: { threshold: 0.60, action: warn }
+
+  sexual/minors: { threshold: 0.01, action: ban }
+  sexual/explicit: { threshold: 0.60, action: block }
+  sexual: { threshold: 0.70, action: warn }
+
+  self-harm/intent: { threshold: 0.30, action: support }
+  self-harm/instructions: { threshold: 0.10, action: support }
+
+  violence/graphic: { threshold: 0.50, action: warn }
+  violence: { threshold: 0.60, action: warn }
+
+  # Add more categories as your usage surfaces them. Keys must match the
+  # category names returned by the Moderation API (normalized in code).
+
+unknown: { action: allow }

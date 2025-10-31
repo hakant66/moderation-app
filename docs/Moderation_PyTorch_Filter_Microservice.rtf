@@ -1,0 +1,409 @@
+{\rtf1\ansi\deff0
+{\b Moderation App – PyTorch Filter Microservice (Add-on) \line}
+\line
+{\b Overview}\line
+This document contains a runnable design for a PyTorch-based pre-filter microservice to complement an OpenAI Moderation-based website. The microservice quickly classifies content (text or images) to early-block or early-allow obvious cases and forwards uncertain cases to the backend, which then calls OpenAI’s Moderation endpoint. A tiny JSONL training dataset template is included for smoke tests.\line
+\line
+{\b Architecture (high level)}\line
+Upload -> PyTorch filter (fast local) -> if high confidence unsafe: block; if low confidence safe: allow; else -> OpenAI Moderation -> policy rules -> decision.\line
+\line
+{\b File tree additions}\line
+moderation-app/\line
+  ├─ torch_filter/\line
+  │  ├─ service.py\line
+  │  ├─ model.py                (image example)\line
+  │  ├─ export_script.py        (image example TorchScript export)\line
+  │  ├─ text_model.py           (DistilRoBERTa binary classifier)\line
+  │  ├─ text_dataset.py         (JSONL dataset + collator)\line
+  │  ├─ train_text.py           (tiny training loop)\line
+  │  ├─ export_text.py          (TorchScript export)\line
+  │  ├─ filters/                (holds .ts files)\line
+  │  └─ requirements.txt\line
+  ├─ backend/\line
+  │  └─ cascade.py              (calls torch_filter, combines decisions)\line
+  └─ docker-compose.yml         (optional)\line
+\line
+{\b torch_filter/requirements.txt}\line
+\line
+
+fastapi==0.115.2
+uvicorn[standard]==0.30.6
+torch==2.3.1
+torchvision==0.18.1
+pillow==10.4.0
+pydantic==2.9.2
+transformers==4.44.2
+tokenizers==0.19.1
+\line\line
+----------------------------------------
+torch_filter/model.py  (image model sample)
+----------------------------------------
+import torch
+import torch.nn as nn
+import torchvision.models as models
+
+class TinyNSFW(nn.Module):
+    def __init__(self):
+        super().__init__()
+        base = models.mobilenet_v3_small(weights=None)
+        in_f = base.classifier[0].out_features
+        base.classifier = nn.Identity()
+        self.base = base
+        self.head = nn.Sequential(
+            nn.Linear(in_f, 128), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128, 1)  # binary logit: unsafe
+        )
+    def forward(self, x):
+        f = self.base(x)
+        return self.head(f).squeeze(1)
+
+def load_model(weights_path: str | None = None) -> nn.Module:
+    m = TinyNSFW()
+    if weights_path:
+        m.load_state_dict(torch.load(weights_path, map_location="cpu"))
+    m.eval()
+    return m
+\line\line
+----------------------------------------
+torch_filter/export_script.py (image TorchScript export)
+----------------------------------------
+import torch
+from model import load_model
+
+m = load_model()
+example = torch.randn(1, 3, 224, 224)
+ts = torch.jit.trace(m, example)
+ts.save("filters/model.ts")
+print("saved filters/model.ts")
+\line\line
+----------------------------------------
+torch_filter/service.py  (serves image + text endpoints)
+----------------------------------------
+import io, base64, os
+import torch
+from PIL import Image
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import torchvision.transforms as T
+from pydantic import BaseModel
+from transformers import AutoTokenizer
+
+app = FastAPI(title="torch-filter", version="0.1.0")
+
+# Image preprocess
+pre = T.Compose([T.Resize(256), T.CenterCrop(224), T.ToTensor(),
+                 T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])])
+image_model = torch.jit.load("filters/model.ts", map_location="cpu").eval()
+
+def _img_from_bytes(b: bytes) -> torch.Tensor:
+    from io import BytesIO
+    return pre(Image.open(BytesIO(b)).convert("RGB")).unsqueeze(0)
+
+@app.get("/health")
+def health():
+    return \{"ok": True\}
+
+@app.post("/predict/image")
+async def predict_image(file: UploadFile = File(None), image_b64: str | None = Form(None)):
+    if not file and not image_b64:
+        raise HTTPException(400, "provide file or image_b64")
+    data = await file.read() if file else base64.b64decode(image_b64.split(",")[-1])
+    with torch.inference_mode():
+        logit = image_model(_img_from_bytes(data)).item()
+        prob = float(torch.sigmoid(torch.tensor(logit)).item())
+    return \{"score": prob, "label": "unsafe_image"\}
+
+# Text path (uses TorchScript text model below)
+TOK_NAME = os.getenv("TEXT_MODEL", "distilroberta-base")
+TOKENIZER = AutoTokenizer.from_pretrained(TOK_NAME, use_fast=True)
+TEXT_TS_PATH = os.getenv("TEXT_TS", "filters/text_model.ts")
+text_model = torch.jit.load(TEXT_TS_PATH, map_location="cpu").eval()
+MAXLEN = int(os.getenv("MAXLEN", 256))
+
+class TextIn(BaseModel):
+    text: str
+
+@app.post("/predict/text")
+async def predict_text(inp: TextIn):
+    enc = TOKENIZER(inp.text, padding="max_length", truncation=True, max_length=MAXLEN, return_tensors="pt")
+    with torch.inference_mode():
+        logit = text_model(enc["input_ids"], enc["attention_mask"]).item()
+        prob = float(torch.sigmoid(torch.tensor(logit)).item())
+    return \{"score": prob, "label": "unsafe_text"\}
+\line\line
+----------------------------------------
+torch_filter/text_model.py (DistilRoBERTa binary classifier)
+----------------------------------------
+import torch
+import torch.nn as nn
+from transformers import AutoModel, AutoConfig
+
+class DistilRobertaBinary(nn.Module):
+    def __init__(self, model_name: str = "distilroberta-base"):
+        super().__init__()
+        self.config = AutoConfig.from_pretrained(model_name)
+        self.backbone = AutoModel.from_pretrained(model_name, add_pooling_layer=False)
+        hidden = self.backbone.config.hidden_size
+        self.dropout = nn.Dropout(0.1)
+        self.head = nn.Linear(hidden, 1)  # binary logit: prob(unsafe)
+
+    def forward(self, input_ids, attention_mask):
+        out = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        last = out.last_hidden_state  # (B, T, H)
+        mask = attention_mask.unsqueeze(-1).float()
+        pooled = (last * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        x = self.dropout(pooled)
+        logit = self.head(x).squeeze(1)
+        return logit
+\line\line
+----------------------------------------
+torch_filter/text_dataset.py (JSONL + collator)
+----------------------------------------
+import json
+from dataclasses import dataclass
+from typing import List, Dict
+from transformers import AutoTokenizer
+
+@dataclass
+class TextItem:
+    text: str
+    label: int
+
+class JsonlTextDataset:
+    def __init__(self, path: str):
+        self.items: List[TextItem] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                self.items.append(TextItem(obj["text"], int(obj["label"])))
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> TextItem:
+        return self.items[idx]
+
+class Collator:
+    def __init__(self, model_name: str = "distilroberta-base", max_len: int = 256):
+        self.tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        self.max_len = max_len
+
+    def __call__(self, batch: List[TextItem]) -> Dict:
+        import torch
+        texts = [b.text for b in batch]
+        labels = [b.label for b in batch]
+        out = self.tok(texts, padding=True, truncation=True, max_length=self.max_len, return_tensors="pt")
+        out["labels"] = torch.tensor(labels, dtype=torch.float)
+        return out
+\line\line
+----------------------------------------
+torch_filter/train_text.py (tiny loop + F1)
+----------------------------------------
+import os, torch
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.nn.functional import binary_cross_entropy_with_logits
+from text_model import DistilRobertaBinary
+from text_dataset import JsonlTextDataset, Collator
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_NAME = os.getenv("TEXT_MODEL", "distilroberta-base")
+TRAIN_PATH = os.getenv("TRAIN_PATH", "data/train.jsonl")
+VAL_PATH = os.getenv("VAL_PATH", "data/val.jsonl")
+BATCH = int(os.getenv("BATCH", 16))
+EPOCHS = int(os.getenv("EPOCHS", 2))
+LR = float(os.getenv("LR", 5e-5))
+MAXLEN = int(os.getenv("MAXLEN", 256))
+OUT = os.getenv("OUT", "filters/text_model.pt")
+
+def f1_score_tp_fp_fn(tp, fp, fn):
+    p = tp / max(tp + fp, 1)
+    r = tp / max(tp + fn, 1)
+    f1 = 2*p*r / max(p + r, 1e-9)
+    return p, r, f1
+
+def evaluate(model, loader):
+    model.eval()
+    tp = fp = fn = 0
+    with torch.no_grad():
+        for batch in loader:
+            labels = batch.pop("labels").to(DEVICE)
+            for k in ("input_ids", "attention_mask"):
+                batch[k] = batch[k].to(DEVICE)
+            logits = model(**batch)
+            probs = torch.sigmoid(logits)
+            preds = (probs >= 0.5).float()
+            tp += int(((preds == 1) & (labels == 1)).sum())
+            fp += int(((preds == 1) & (labels == 0)).sum())
+            fn += int(((preds == 0) & (labels == 1)).sum())
+    return f1_score_tp_fp_fn(tp, fp, fn)
+
+def main():
+    train_ds = JsonlTextDataset(TRAIN_PATH)
+    val_ds = JsonlTextDataset(VAL_PATH)
+    collate = Collator(MODEL_NAME, MAXLEN)
+    train_dl = DataLoader(train_ds, batch_size=BATCH, shuffle=True, collate_fn=collate)
+    val_dl = DataLoader(val_ds, batch_size=BATCH, shuffle=False, collate_fn=collate)
+
+    model = DistilRobertaBinary(MODEL_NAME).to(DEVICE)
+    opt = AdamW(model.parameters(), lr=LR)
+
+    for epoch in range(EPOCHS):
+        model.train()
+        for i, batch in enumerate(train_dl, 1):
+            labels = batch.pop("labels").to(DEVICE)
+            for k in ("input_ids", "attention_mask"):
+                batch[k] = batch[k].to(DEVICE)
+            logits = model(**batch)
+            loss = binary_cross_entropy_with_logits(logits, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step(); opt.zero_grad()
+
+        p, r, f1 = evaluate(model, val_dl)
+        print(f"epoch \{epoch+1\} | val P=\{p:.3f\} R=\{r:.3f\} F1=\{f1:.3f\}")
+
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    torch.save(model.state_dict(), OUT)
+    print(f"saved weights -> \{OUT\}")
+
+if __name__ == "__main__":
+    main()
+\line\line
+----------------------------------------
+torch_filter/export_text.py (TorchScript export)
+----------------------------------------
+import os, torch
+from text_model import DistilRobertaBinary
+
+MODEL_NAME = os.getenv("TEXT_MODEL", "distilroberta-base")
+WEIGHTS = os.getenv("WEIGHTS", "filters/text_model.pt")
+OUT = os.getenv("OUT", "filters/text_model.ts")
+MAXLEN = int(os.getenv("MAXLEN", 256))
+
+m = DistilRobertaBinary(MODEL_NAME)
+m.load_state_dict(torch.load(WEIGHTS, map_location="cpu"))
+m.eval()
+
+example_ids = torch.ones(1, MAXLEN, dtype=torch.long)
+example_mask = torch.ones(1, MAXLEN, dtype=torch.long)
+ts = torch.jit.trace(m, (example_ids, example_mask))
+os.makedirs(os.path.dirname(OUT), exist_ok=True)
+ts.save(OUT)
+print(f"saved TorchScript -> \{OUT\}")
+\line\line
+----------------------------------------
+backend/cascade.py (call microservice)
+----------------------------------------
+import os, base64, httpx
+
+FILTER_URL = os.getenv("TORCH_FILTER_URL", "http://localhost:9000")
+
+async def filter_image_bytes(data: bytes) -> float:
+    async with httpx.AsyncClient(timeout=5.0) as cx:
+        b64 = base64.b64encode(data).decode("utf-8")
+        r = await cx.post(f"\{FILTER_URL\}/predict/image", data=\{"image_b64": b64\})
+        r.raise_for_status()
+        return float(r.json().get("score", 0.0))
+
+async def filter_text(text: str) -> float:
+    async with httpx.AsyncClient(timeout=5.0) as cx:
+        r = await cx.post(f"\{FILTER_URL\}/predict/text", json=\{"text": text\})
+        r.raise_for_status()
+        return float(r.json().get("score", 0.0))
+\line\line
+----------------------------------------
+docker-compose.yml (optional)
+----------------------------------------
+version: "3.9"
+services:
+  torch_filter:
+    build:
+      context: ./torch_filter
+      dockerfile: Dockerfile
+    ports: ["9000:9000"]
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      OPENAI_API_KEY: $\{OPENAI_API_KEY\}
+      TORCH_FILTER_URL: http://torch_filter:9000
+      FILTER_BLOCK: "0.97"
+      FILTER_ALLOW: "0.03"
+      FILTER_EARLY_ALLOW: "0"
+    depends_on: [torch_filter]
+    ports: ["8000:8000"]
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      VITE_API_BASE: http://backend:8000
+    depends_on: [backend]
+    ports: ["5173:5173"]
+\line\line
+----------------------------------------
+Tiny training dataset template (JSONL)
+----------------------------------------
+torch_filter/data/train.jsonl
+\{"text": "Have a great day!", "label": 0\}
+\{"text": "Thanks for the quick reply.", "label": 0\}
+\{"text": "Let's schedule the meeting for Friday.", "label": 0\}
+\{"text": "This tutorial was super helpful.", "label": 0\}
+\{"text": "I totally disagree but let's keep it constructive.", "label": 0\}
+\{"text": "The picture shows a cat sleeping on a sofa.", "label": 0\}
+\{"text": "Friendly reminder: update your password regularly.", "label": 0\}
+\{"text": "Congrats on your promotion!", "label": 0\}
+
+\{"text": "I'm going to hurt you.", "label": 1\}
+\{"text": "You don't belong here. Leave now.", "label": 1\}
+\{"text": "This is a threat. I will find you.", "label": 1\}
+\{"text": "Graphic injury description [redacted].", "label": 1\}
+\{"text": "Encouraging self-harm [redacted].", "label": 1\}
+\{"text": "Sexual content involving minors [redacted].", "label": 1\}
+\{"text": "Harassing and demeaning language [redacted].", "label": 1\}
+\{"text": "Terroristic intent reference [redacted].", "label": 1\}
+
+torch_filter/data/val.jsonl
+\{"text": "Appreciate your help on this task.", "label": 0\}
+\{"text": "The weather is beautiful today.", "label": 0\}
+\{"text": "Please consider the code review comments.", "label": 0\}
+\{"text": "Nice work on the design draft.", "label": 0\}
+
+\{"text": "I'm going to make you suffer.", "label": 1\}
+\{"text": "Violent act description [redacted].", "label": 1\}
+\{"text": "Coercive sexual content [redacted].", "label": 1\}
+\{"text": "Self-harm instructions [redacted].", "label": 1\}
+
+Notes:
+- 0 = safe, 1 = unsafe
+- For production, replace placeholders with policy-reviewed internal examples.
+\line\line
+----------------------------------------
+Local run (summary)
+----------------------------------------
+# Torch filter
+cd torch_filter
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python train_text.py       # saves filters/text_model.pt
+python export_text.py      # saves filters/text_model.ts
+uvicorn service:app --reload --port 9000
+
+# Backend
+cd ../backend
+pip install -r requirements.txt httpx
+export OPENAI_API_KEY=sk-...
+export TORCH_FILTER_URL=http://localhost:9000
+uvicorn main:app --reload --port 8000
+
+# Frontend
+cd ../frontend
+npm install
+VITE_API_BASE=http://localhost:8000 npm run dev
+\line
+}

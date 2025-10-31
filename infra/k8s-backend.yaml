@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moderation-policy
+data:
+  policy.yaml: |
+    # Actions: allow | warn | support | block | ban
+    rules:
+      hate/threatening: { threshold: 0.50, action: block }
+      harassment/threats: { threshold: 0.50, action: block }
+      harassment: { threshold: 0.60, action: warn }
+
+      sexual/minors: { threshold: 0.01, action: ban }
+      sexual/explicit: { threshold: 0.60, action: block }
+      sexual: { threshold: 0.70, action: warn }
+
+      self-harm/intent: { threshold: 0.30, action: support }
+      self-harm/instructions: { threshold: 0.10, action: support }
+
+      violence/graphic: { threshold: 0.50, action: warn }
+      violence: { threshold: 0.60, action: warn }
+
+    unknown: { action: allow }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openai-api-key
+type: Opaque
+stringData:
+  OPENAI_API_KEY: "replace-with-your-real-key"  # or use data: with base64 if preferred
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moderation-backend
+  labels: { app: moderation-backend }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: moderation-backend }
+  template:
+    metadata:
+      labels: { app: moderation-backend }
+    spec:
+      containers:
+        - name: backend
+          image: moderation-backend:latest  # or your registry/image:tag
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: openai-api-key, key: OPENAI_API_KEY }
+            - { name: TORCH_FILTER_URL, value: "http://torch-filter:9000" }
+            - { name: FILTER_BLOCK, value: "0.97" }
+            - { name: FILTER_ALLOW, value: "0.03" }
+            - { name: FILTER_EARLY_ALLOW, value: "0" }
+            - { name: CORS_ORIGINS, value: "*" }
+            - { name: POLICY_FILE, value: "/app/policy/policy.yaml" }
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet: { path: /api/health, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /api/health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+          volumeMounts:
+            - name: policy
+              mountPath: /app/policy
+              readOnly: true
+      volumes:
+        - name: policy
+          configMap:
+            name: moderation-policy
+            items:
+              - key: policy.yaml
+                path: policy.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moderation-backend
+  labels: { app: moderation-backend }
+spec:
+  selector: { app: moderation-backend }
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP

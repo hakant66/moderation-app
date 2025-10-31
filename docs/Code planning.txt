@@ -1,0 +1,228 @@
+# We'll generate a runnable FastAPI starter (backend) and a super-minimal static frontend.
+# Files:
+# - moderation_app/main.py (FastAPI server)
+# - moderation_app/policy.py (policy thresholds/actions)
+# - moderation_app/normalize.py (shape OpenAI response -> decision)
+# - moderation_app/schemas.py (pydantic models)
+# - requirements.txt
+# - README.md
+# - frontend/index.html, frontend/app.js, frontend/styles.css
+# - run.sh
+# 
+# After creating, we will show the user download links. 
+import os, textwrap, json, base64, pathlib
+
+base = "/mnt/data/moderation_starter"
+os.makedirs(base, exist_ok=True)
+os.makedirs(f"{base}/moderation_app", exist_ok=True)
+os.makedirs(f"{base}/frontend", exist_ok=True)
+
+main_py = r'''
+import os
+import base64
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any, List
+from openai import OpenAI
+from .policy import Policy, DEFAULT_POLICY
+from .normalize import normalize_response
+from .schemas import TextIn, ImageOut, TextOut
+
+# Initialize
+app = FastAPI(title="Moderation Service (Text + Images)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    print("WARNING: OPENAI_API_KEY not set; API calls will fail.")
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+MODEL = os.getenv("MODERATION_MODEL", "omni-moderation-latest")
+
+POLICY = DEFAULT_POLICY
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": MODEL}
+
+@app.post("/api/moderate/text", response_model=TextOut)
+async def moderate_text(payload: TextIn):
+    if not payload.text or not payload.text.strip():
+        raise HTTPException(400, "empty text")
+    try:
+        res = client.moderations.create(
+            model=MODEL,
+            input=payload.text
+        )
+    except Exception as e:
+        raise HTTPException(502, f"OpenAI error: {e}")
+    out = normalize_response(res, POLICY)
+    return TextOut(**out)
+
+@app.post("/api/moderate/image", response_model=ImageOut)
+async def moderate_image(file: UploadFile = File(None), image_url: Optional[str] = Form(None)):
+    if not file and not image_url:
+        raise HTTPException(400, "supply file or image_url")
+    try:
+        if file:
+            data = await file.read()
+            if len(data) > 8 * 1024 * 1024:
+                raise HTTPException(413, "file too large (>8MB)")
+            # Create a data URL to pass to Moderations API
+            b64 = base64.b64encode(data).decode("utf-8")
+            url = f"data:{file.content_type or 'image/jpeg'};base64,{b64}"
+        else:
+            url = image_url  # assume http(s) or data: URL
+        # Multimodal payload for moderations API
+        payload = [{"type": "input_image", "image_url": {"url": url}}]
+        res = client.moderations.create(
+            model=MODEL,
+            input=payload
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"OpenAI error: {e}")
+    out = normalize_response(res, POLICY)
+    return ImageOut(**out)
+'''
+open(f"{base}/moderation_app/main.py", "w").write(main_py)
+
+policy_py = r'''
+from dataclasses import dataclass
+from typing import Dict, Any
+
+@dataclass
+class Policy:
+    # threshold per category and default action
+    thresholds: dict
+    actions: dict
+
+# Example mapping; adjust as needed
+DEFAULT_POLICY = Policy(
+    thresholds={
+        "sexual/minors": 0.01,
+        "hate/threatening": 0.5,
+        "self-harm": 0.3,
+        "violence/graphic": 0.5,
+        # fallback threshold for other categories
+        "_default": 0.5,
+    },
+    actions={
+        "sexual/minors": "ban",
+        "hate/threatening": "block",
+        "self-harm": "support_interstitial",
+        "violence/graphic": "warn_blur",
+        "_default": "warn"
+    }
+)
+'''
+open(f"{base}/moderation_app/policy.py", "w").write(policy_py)
+
+normalize_py = r'''
+from typing import Dict, Any, Tuple
+
+def decision_for_category(cat: str, score: float, policy) -> Tuple[bool, str]:
+    th = policy.thresholds.get(cat, policy.thresholds["_default"])
+    action = policy.actions.get(cat, policy.actions["_default"])
+    return (score >= th, action)
+
+def flatten_categories(res_obj: dict) -> dict:
+    # Works for both legacy and omni outputs that include 'results'
+    results = res_obj.get("results", [])
+    if not results:
+        # Some SDKs return .results as attribute; fallback
+        results = getattr(res_obj, "results", [])
+    if not results:
+        return {}
+    r0 = results[0]
+    cats = r0.get("categories") or getattr(r0, "categories", {})
+    scores = r0.get("category_scores") or getattr(r0, "category_scores", {})
+    flagged = r0.get("flagged") if "flagged" in r0 else getattr(r0, "flagged", False)
+    return {"categories": cats, "scores": scores, "flagged": flagged}
+
+def normalize_response(res, policy) -> dict:
+    # Convert SDK response to dict
+    res_obj = res if isinstance(res, dict) else res.model_dump() if hasattr(res, "model_dump") else res.__dict__
+    flat = flatten_categories(res_obj)
+    cats = flat.get("categories", {})
+    scores = flat.get("scores", {})
+    reasons = []
+    final_decision = "allow"
+    for cat, val in scores.items():
+        hit, action = decision_for_category(cat, float(val), policy)
+        if hit:
+            reasons.append({"category": cat, "score": float(val), "action": action})
+            # escalate to worst action if multiple
+            if action in ("ban", "block"):
+                final_decision = "block"
+            elif action in ("warn_blur", "warn") and final_decision == "allow":
+                final_decision = "warn"
+            elif action == "support_interstitial" and final_decision != "block":
+                final_decision = "warn"
+    return {
+        "decision": final_decision,
+        "categories": cats,
+        "scores": {k: float(v) for k, v in scores.items()},
+        "reasons": reasons
+    }
+'''
+open(f"{base}/moderation_app/normalize.py", "w").write(normalize_py)
+
+schemas_py = r'''
+from pydantic import BaseModel
+from typing import Dict, Any, List
+
+class TextIn(BaseModel):
+    text: str
+
+class CommonOut(BaseModel):
+    decision: str
+    categories: dict
+    scores: dict
+    reasons: list
+
+class TextOut(CommonOut):
+    pass
+
+class ImageOut(CommonOut):
+    pass
+'''
+open(f"{base}/moderation_app/schemas.py", "w").write(schemas_py)
+
+requirements = """\
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+openai>=1.40.0
+pydantic>=2.7.0
+python-multipart>=0.0.9
+"""
+open(f"{base}/requirements.txt", "w").write(requirements)
+
+readme = r'''
+# Moderation Website Starter (FastAPI + OpenAI Moderations)
+
+This starter provides a minimal backend (FastAPI) and static frontend to check **text and images** with OpenAI's Moderation API.
+
+## Features
+- Endpoints:
+  - `POST /api/moderate/text` → `{ text }`
+  - `POST /api/moderate/image` → multipart file **or** `image_url`
+- Uses `omni-moderation-latest` by default (multimodal).
+- Simple **policy** thresholds → actions (allow/warn/block/ban).
+- CORS enabled via env `CORS_ALLOW_ORIGINS` (default `*`).
+
+## Quickstart
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+export OPENAI_API_KEY=sk-...   # never hardcode
+export MODERATION_MODEL=omni-moderation-latest
+uvicorn moderation_app.main:app --reload --port 8000

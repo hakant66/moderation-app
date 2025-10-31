@@ -1,0 +1,30 @@
+version: "3.9"
+services:
+  torch_filter:
+    build:
+      context: ./torch_filter
+      dockerfile: Dockerfile
+    ports: ["9000:9000"]
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TORCH_FILTER_URL: http://torch_filter:9000
+      FILTER_BLOCK: "0.97"
+      FILTER_ALLOW: "0.03"
+      FILTER_EARLY_ALLOW: "0"
+      CORS_ORIGINS: "*"
+    depends_on: [torch_filter]
+    ports: ["8000:8000"]
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      VITE_API_BASE: http://backend:8000
+    depends_on: [backend]
+    ports: ["5173:5173"]

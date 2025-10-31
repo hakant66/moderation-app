@@ -1,0 +1,17 @@
+{"text": "Have a great day!", "label": 0}
+{"text": "Thanks for the quick reply.", "label": 0}
+{"text": "Let's schedule the meeting for Friday.", "label": 0}
+{"text": "This tutorial was super helpful.", "label": 0}
+{"text": "I totally disagree but let's keep it constructive.", "label": 0}
+{"text": "The picture shows a cat sleeping on a sofa.", "label": 0}
+{"text": "Friendly reminder: update your password regularly.", "label": 0}
+{"text": "Congrats on your promotion!", "label": 0}
+
+{"text": "I'm going to hurt you.", "label": 1}
+{"text": "You don't belong here. Leave now.", "label": 1}
+{"text": "This is a threat. I will find you.", "label": 1}
+{"text": "Graphic injury description [redacted].", "label": 1}
+{"text": "Encouraging self-harm [redacted].", "label": 1}
+{"text": "Sexual content involving minors [redacted].", "label": 1}
+{"text": "Harassing and demeaning language [redacted].", "label": 1}
+{"text": "Terroristic intent reference [redacted].", "label": 1}

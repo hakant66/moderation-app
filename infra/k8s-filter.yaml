@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: torch-filter
+  labels: { app: torch-filter }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: torch-filter }
+  template:
+    metadata:
+      labels: { app: torch-filter }
+    spec:
+      containers:
+        - name: torch-filter
+          image: torch-filter:latest   # or your registry/image:tag
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: IMAGE_TS, value: "filters/model.ts" }
+            - { name: TEXT_TS,  value: "filters/text_model.ts" }
+            - { name: TEXT_MODEL, value: "distilroberta-base" }
+            - { name: MAXLEN, value: "256" }
+          ports:
+            - containerPort: 9000
+          readinessProbe:
+            httpGet: { path: /health, port: 9000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 9000 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+          volumeMounts:
+            # Optional: mount real TorchScript artifacts as a ConfigMap/Secret/CSI volume
+            - name: filters
+              mountPath: /app/filters
+      volumes:
+        - name: filters
+          emptyDir: {}   # replace with a real volume if you want to ship models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: torch-filter
+  labels: { app: torch-filter }
+spec:
+  selector: { app: torch-filter }
+  ports:
+    - name: http
+      port: 9000
+      targetPort: 9000
+  type: ClusterIP

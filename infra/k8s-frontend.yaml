@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moderation-frontend
+  labels: { app: moderation-frontend }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: moderation-frontend }
+  template:
+    metadata:
+      labels: { app: moderation-frontend }
+    spec:
+      containers:
+        - name: frontend
+          image: moderation-frontend:latest   # or your registry/image:tag
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: VITE_API_BASE
+              value: "http://moderation-backend:8000"
+          ports:
+            - containerPort: 5173
+          readinessProbe:
+            httpGet: { path: "/", port: 5173 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: "/", port: 5173 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "200m", memory: "128Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moderation-frontend
+  labels: { app: moderation-frontend }
+spec:
+  selector: { app: moderation-frontend }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 5173
+  type: ClusterIP
