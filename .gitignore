@@ -1,2 +1,38 @@
+# Cache and log
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.log
+
+# Node/TS
+node_modules/
+dist/
+build/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets
 .env
 backend/.env
+./GitHubToken.docx
+
+# Training runs & checkpoints
+torch_filter/runs/
+torch_filter/outputs/
+torch_filter/checkpoints/
+*.pt
+*.pth
+*.onnx
+
+# Large artifacts and caches
+torch_filter/filters/*.ts
+torch_filter/filters/*.safetensors
+torch_filter/.cache/
+.cache/
+huggingface/
+hf_cache/
